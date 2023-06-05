@@ -14,6 +14,7 @@ import flask_cors
 from PIL import Image
 
 from .image_processing import render_heatmap
+from virelay.model import TimeSeriesSample
 
 
 class Server:
@@ -425,7 +426,14 @@ class Server:
         superimpose = flask.request.args.get('superimpose', 'false').upper() == 'TRUE'
         if superimpose:
             sample = project.get_sample(attribution.index)
-            heatmap = attribution.render_heatmap(color_map_name, superimpose=sample.data)
+
+            # Check if this is a time series sample, in that case the treatment is different, we need the raw data and
+            # not the image (as using matplotlib both for plotting the sample and the attribution map overlay)
+            if isinstance(sample, TimeSeriesSample):
+                heatmap = attribution.render_heatmap(color_map_name, superimpose=sample.raw_data)
+            else:
+                heatmap = attribution.render_heatmap(color_map_name, superimpose=sample.data)
+
         else:
             heatmap = attribution.render_heatmap(color_map_name)
         return send_image_file(heatmap)

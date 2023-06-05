@@ -4,6 +4,7 @@ import math
 
 import numpy
 import matplotlib.cm
+from matplotlib import pyplot as plt
 from PIL import Image
 
 
@@ -137,7 +138,10 @@ def render_heatmap(attribution_data, color_map):
     }
 
     # Checks if the raw attribution has more than one channel, in that case the channels are summed up
-    if len(attribution_data.shape) == 3 and attribution_data.shape[-1] > 1:
+    if len(attribution_data.shape) == 3:  # and attribution_data.shape[-1] > 1: # this condition was removed as
+        # the input must include color channel according to the documentation, and the shape for heatmaps must be
+        # [width, height] and not [width, height, channel] in order for the processing below to work (i.e., the channel
+        # axis must be removed anyway)
         attribution_data = numpy.sum(attribution_data, axis=2)
 
     # Checks the name of the color map and renders the heatmap image accordingly, if the color map is not supported,
@@ -211,6 +215,40 @@ def render_superimposed_heatmap(attribution_data, superimpose, color_map):
 
     # Returns the rendered heatmap
     return numpy.array(superimposed_heatmap)
+
+
+def render_superimposed_heatmap_time_series(attribution_data, superimpose, color_map, is_prediction_correct: bool,
+                                            sample_index: int):
+    """
+        Renders the heatmap and superimposes it onto the specified image. This function supports only time series data
+
+        Parameters
+        ----------
+            attribution_data: numpy.ndarray
+                The raw attribution data for which the heatmap is to be rendered.
+            superimpose: numpy.ndarray
+                A time series onto which the heatmap is to be superimposed.
+            color_map: str
+                The name of color map that is to be used to render the heatmap.
+            is_prediction_correct: Whether the model's prediction for this sample is identical to the ground truth label
+
+        Raises
+        ------
+            ValueError
+                If the specified color map is unknown, then a ValueError is raised.
+
+        Returns
+        -------
+            numpy.ndarray
+                Returns the heatmap image.
+        """
+
+    # Check if time series, then do different treatment
+    ####
+    # Create time series overlay
+    overlay = create_time_series_attribution_overlay(superimpose, render_heatmap(attribution_data, color_map),
+                                                     is_prediction_correct, sample_index)
+    return overlay
 
 
 def generate_heatmap_image_using_matplotlib(attribution_data, color_map_name):
@@ -384,3 +422,89 @@ def generate_heatmap_image_black_yellow(attribution_data):
 
     # Returns the generated heatmap image
     return heatmap
+
+
+def convert_fig_to_image(input_fig: plt.Figure):
+    """
+    Converts a matplotlib figure ot an image
+    :param input_fig: The matplotlib figure to convert
+    :return: An image of input_fig in PIL format, in a numpy array
+    """
+
+    input_fig.canvas.draw()
+    img = Image.frombytes('RGB', input_fig.canvas.get_width_height(), input_fig.canvas.tostring_rgb())
+    plt.close(input_fig)  # Close the figure to release memory
+    return numpy.array(img)
+
+
+def convert_time_series_to_image(sample_data):
+    """
+    Converts a time series sample to an image that can be rendered by virelay
+    :param sample_data: a tensor containing the time series data, in shape (features, series_length, channel). Channel
+    will always be 1 for time series data, as it has no meaning in this context, and it's added only for compatibility
+    with virelay requirements. Note: currently supports ONLY univariate time series
+    :return: a Numpy array representing an image view of the time series signal
+    """
+
+    fig = plt.figure(figsize=(3, 3))
+    plt.plot(numpy.arange(sample_data.shape[2]), sample_data[0, 0, :])
+
+    # Include only the signal in the image so it the overlay view has relevant meaning (TODO: check scaling!!)
+    plt.axis('off')
+    fig.tight_layout()
+
+    out_img_arr = convert_fig_to_image(fig)
+    return out_img_arr
+
+
+def create_time_series_attribution_overlay(raw_sample_data, rendered_heatmap, is_prediction_correct: bool,
+                                           sample_index: int):
+    """
+    Creates overlay of heatmap on a time series sample
+
+    :param raw_sample_data: the sample data in raw form extracted from the HFD5 DB
+    :param rendered_heatmap: the rendered heatmap to overlay on the sample
+    :param is_prediction_correct: whether the model predicted correctly the ground truth label for this sample
+    :return: a numpu array of the image
+    """
+
+    # Normalizing the rendered heatmap so we have RGB values between [0, 1]
+    rendered_heatmap = normalize_image(rendered_heatmap)
+
+    # Plotting the time series sample
+    time_series_len = raw_sample_data.shape[2]
+    fig = plt.figure(figsize=(3, 3))
+    plt.plot(numpy.arange(time_series_len), raw_sample_data[0, 0, :])
+    plt.axis('off')
+
+    # Plot whether the model's prediction is correct or not in the top left corner of the overlay image
+    plt.text(0, numpy.max(raw_sample_data[0, 0, :]), f'Correct pred = {is_prediction_correct} index={sample_index}',
+             fontsize=12)
+    fig.tight_layout()
+
+    # Plotting the overlay
+    colors_list = []
+    alpha = 0.36
+    for i in range(time_series_len):
+        rgb_tuple = (rendered_heatmap[0, i][0], rendered_heatmap[0, i][1], rendered_heatmap[0, i][2], alpha)
+        colors_list.append(rgb_tuple)
+    plt.vlines(numpy.arange(raw_sample_data.shape[2]), colors=colors_list, ymin=min(raw_sample_data.squeeze()),
+               ymax=max(raw_sample_data.squeeze()))
+
+    return convert_fig_to_image(fig)
+
+
+def normalize_image(image: numpy.ndarray):
+    """
+    Normalizes an image to be within the range [0, 1]
+    :param image: A numpy array representing an image
+    :return: The normalized image
+    """
+
+    min_val, max_val = numpy.min(image), numpy.max(image)
+    image = (image - min_val) / (max_val - min_val)
+
+    return image
+
+
+

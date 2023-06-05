@@ -11,7 +11,8 @@ import h5py
 import numpy
 from PIL import Image
 
-from .image_processing import add_border, center_crop, render_heatmap, render_superimposed_heatmap
+from .image_processing import add_border, center_crop, render_heatmap, render_superimposed_heatmap, \
+    convert_time_series_to_image, render_superimposed_heatmap_time_series
 
 
 class Project:
@@ -59,11 +60,14 @@ class Project:
                 # Loads the dataset of the project
                 if 'dataset' in project:
                     dataset_type = project['dataset']['type']
+                    # Whether the dataset is time series, opposed to the default option of image data
+                    # TODO: check what happens when 'time_series' is missing
+                    self.is_time_series_data = project['dataset']['time_series']
                     if dataset_type == 'hdf5':
                         self.dataset = Hdf5Dataset(
                             project['dataset']['name'],
                             os.path.join(working_directory, project['dataset']['path']),
-                            self.label_map
+                            self.label_map, is_time_series=self.is_time_series_data
                         )
                     elif dataset_type == 'image_directory':
                         self.dataset = ImageDirectoryDataset(
@@ -87,7 +91,7 @@ class Project:
                     for attribution_database in project['attributions']['sources']:
                         self.attributions.append(AttributionDatabase(
                             os.path.join(working_directory, attribution_database),
-                            self.label_map
+                            self.label_map, is_time_series_attribution=self.is_time_series_data
                         ))
 
                 # Loads the analyses of the project
@@ -358,7 +362,7 @@ class Project:
 class AttributionDatabase:
     """Represents a single attribution database, which contains the attributions for the dataset samples."""
 
-    def __init__(self, attribution_path, label_map):
+    def __init__(self, attribution_path, label_map, is_time_series_attribution=False):
         """
         Initializes a new AttributionDatabase instance.
 
@@ -368,6 +372,8 @@ class AttributionDatabase:
                 The path to the file that contains the attribution database.
             label_map: LabelMap
                 The label map, which contains a mapping between the index of the labels and their human-readable names.
+            is_time_series_attribution: bool
+                Whether the attributions are of time series or standard images
         """
 
         # Initializes some class members
@@ -385,6 +391,8 @@ class AttributionDatabase:
         # whether the sample has the label, when the dataset is single-label, then the label is just a scalar value
         # containing the index of the label)
         self.is_multi_label = self.attribution_file['label'][0].dtype == bool
+
+        self.is_time_series = is_time_series_attribution
 
     def has_attribution(self, index):
         """
@@ -456,12 +464,19 @@ class AttributionDatabase:
         attribution_prediction = self.attribution_file['prediction'][index]
 
         # Wraps the attribution in an object and returns it
-        return Attribution(
-            original_index,
-            attribution_data,
-            attribution_labels,
-            attribution_prediction
-        )
+        if self.is_time_series:
+            ret_value = TimeSeriesAttribution(original_index,
+                                              attribution_data,
+                                              attribution_labels,
+                                              attribution_prediction)
+        else:
+            ret_value = Attribution(original_index,
+                                    attribution_data,
+                                    attribution_labels,
+                                    attribution_prediction)
+
+        return ret_value
+
 
     def close(self):
         """Closes the attribution database."""
@@ -530,6 +545,45 @@ class Attribution:
 
         if superimpose is not None:
             return render_superimposed_heatmap(self.data, superimpose, color_map)
+        return render_heatmap(self.data, color_map)
+
+
+class TimeSeriesAttribution(Attribution):
+    def __init__(self, index, data, labels, prediction):
+        super().__init__(index, data, labels, prediction)
+
+    def render_heatmap(self, color_map, superimpose=None):
+        """
+        Takes the raw time series attribution data and converts it so that the data can be visualized as a heatmap.
+
+        Parameters
+        ----------
+            color_map: str
+                The name of color map that is to be used to render the heatmap.
+            superimpose: numpy.ndarray
+                An optional image onto which the heatmap should be superimposed.
+
+        Raises
+        ------
+            ValueError
+                If the specified color map is unknown, then a ValueError is raised.
+        """
+
+        # Check if the model's prediction for this sample is correct
+        correct_prediction = False
+        gt_label = int(''.join(filter(str.isdigit, self.labels[0])))
+        prediction = numpy.argmax(self.prediction)
+
+        if gt_label == prediction:
+            correct_prediction = True
+
+        # Debug print
+        # print(f'GT label = {self.labels[0]}, Predicted label = {self.prediction} ==> {correct_prediction}')
+
+
+        if superimpose is not None:
+            return render_superimposed_heatmap_time_series(self.data, superimpose, color_map, correct_prediction,
+                                                           self.index)
         return render_heatmap(self.data, color_map)
 
 
@@ -856,7 +910,7 @@ class Analysis:
 class Hdf5Dataset:
     """Represents a dataset that is stored in an HDF5 database."""
 
-    def __init__(self, name, path, label_map):
+    def __init__(self, name, path, label_map, is_time_series=False):
         """
         Initializes a new Hdf5Dataset instance.
 
@@ -878,6 +932,7 @@ class Hdf5Dataset:
         self.name = name
         self.path = path
         self.label_map = label_map
+        self.is_time_series = is_time_series
 
         # Loads the dataset itself
         self.dataset_file = h5py.File(self.path, 'r')
@@ -922,8 +977,11 @@ class Hdf5Dataset:
         except IndexError as error:
             raise LookupError(f'No sample with the index {index} could be found.') from error
 
-        # Wraps the sample in an object and returns it
-        return Sample(index, sample_data, sample_labels)
+        # Wraps the sample in an object and returns it, added different treatment for TimeSeriesSample
+        if self.is_time_series:
+            return TimeSeriesSample(index, sample_data, sample_labels)
+        else:
+            return Sample(index, sample_data, sample_labels)
 
     def __getitem__(self, key):
         """
@@ -1278,6 +1336,22 @@ class Sample:
             elif detected_pixel_value_range_index == 1:
                 self.data *= 255.0
             self.data = self.data.astype(numpy.uint8)
+
+
+class TimeSeriesSample(Sample):
+    def __init__(self, index, data, labels):
+
+        # Stores the arguments for later use
+        self.index = index
+        self.data = data
+        self.raw_data = data  # Save the raw data which is needed for overlay view of time series
+        if not isinstance(labels, list):
+            labels = [labels]
+        self.labels = labels
+
+        # Converts the time series object to numpy array representing an image of the signal (for univariate signal
+        # only)
+        self.data = convert_time_series_to_image(self.data)
 
 
 class LabelMap:
